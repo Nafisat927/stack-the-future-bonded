@@ -1,5 +1,4 @@
 import os
-from turtle import done
 from flask import (
     Flask,
     render_template,
@@ -126,17 +125,23 @@ def onboarding():
                 update_data["hydrogen_bonding_acceptors"] = hba
             if hbd != "na":
                 update_data["hydrogen_bonding_donors"] = hbd
-            update_data["user_id"] = user_id #get user
+            update_data["user_id"] = user_id  # get user
 
             # Check if user exists in prefs
             try:
-                check_res = sb_service().table("prefs").select("user_id").eq("user_id", user_id).execute()
+                check_res = (
+                    sb_service()
+                    .table("prefs")
+                    .select("user_id")
+                    .eq("user_id", user_id)
+                    .execute()
+                )
                 user_exists = len(check_res.data) > 0
             except Exception as e:
-                 user_exists = False
+                user_exists = False
 
             if user_exists:
-                if len(update_data) > 1: # at least 1 preference
+                if len(update_data) > 1:  # at least 1 preference
                     response = (
                         sb_service()
                         .table("prefs")
@@ -145,12 +150,7 @@ def onboarding():
                         .execute()
                     )
                 else:
-                    response = (
-                        sb_service()
-                        .table("prefs")
-                        .insert(update_data)
-                        .execute()
-                    )
+                    response = sb_service().table("prefs").insert(update_data).execute()
 
         except Exception as e:
             flash("Something went wrong. Please try again.", "error")
@@ -214,7 +214,7 @@ def matching():
         lipophilicity=compound.get("AlogP"),
         hba=compound.get("HBA"),
         hbd=compound.get("HBD"),
-        done=False
+        done=False,
     )
 
 
