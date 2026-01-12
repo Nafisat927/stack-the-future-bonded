@@ -268,27 +268,74 @@
           </h2>
           <div class="card-container text-center">
             <div id="compoundCard" class="card compound-card shadow">
-              <img
-                id="compoundImage"
-                src="{{ url_for('get_compound_image', smiles=smiles) }}"
-                class="card-img-top"
-                alt="Compound structure image"
-                style="
-                  width: 100%;
-                  height: auto;
-                  max-height: 400px;
-                  object-fit: contain;
-                "
-              />
+                                          {% if done %}
+                                <h3 class='p-4 text-center'>No more compounds!</h3>
+                            {% else %}
+                                <img id="compoundImage"
+                                     src="{{ url_for('get_compound_image', smiles=smiles) }}"
+                                     class="card-img-top"
+                                     alt="Compound structure image"
+                                     style="width: 100%;
+                                            height: auto;
+                                            max-height: 400px;
+                                            object-fit: contain" />
 
-              <div class="card-body">
-                <div class="compound-text mb-3">
-                  <strong id="compoundName" class="fs-5">{{ name }}</strong>
-                  <br />
-                  <span id="smiles" class="text-muted">{{ smiles }}</span>
+                                <div class="card-body">
+                                    <div class="compound-text mb-3">
+                                        <strong id="compoundName" class="fs-5">{{ name }}</strong>
+                                        <br>
+                                        <span id="smiles" class="text-muted">{{ smiles }}</span>
+                                    </div>
+
+                                    <ul class="list-group mb-4">
+                                        {% if res and res.molecular_weight is not none %}
+                                            <li class="list-group-item">
+                                                <strong>Molecular Weight:</strong>
+                                                {{ res.molecular_weight }}
+                                            </li>
+                                        {% endif %}
+                                        {% if res and res.lipophilicity is not none %}
+                                            <li class="list-group-item">
+                                                <strong>Lipophilicity:</strong>
+                                                {{ res.lipophilicity }}
+                                            </li>
+                                        {% endif %}
+                                        {% if res and res.hydrogen_bonding_acceptors is not none %}
+                                            <li class="list-group-item">
+                                                <strong>HBA:</strong>
+                                                {{ res.hydrogen_bonding_acceptors }}
+                                            </li>
+                                        {% endif %}
+                                        {% if res and res.hydrogen_bonding_donors is not none %}
+                                            <li class="list-group-item">
+                                                <strong>HBA:</strong>
+                                                {{ res.hydrogen_bonding_donors }}
+                                            </li>
+                                        {% endif %}
+                                    </ul>
+
+                                    <div class="d-flex justify-content-around mt-4">
+                                        <button id="dislikeBtn"
+                                                class="btn btn-outline-danger match-btn"
+                                                data-bs-toggle="tooltip"
+                                                title="Skip"
+                                                type="button">
+                                            <i class="bi bi-x-lg"></i>
+                                        </button>
+
+                                        <button id="likeBtn"
+                                                class="btn btn-outline-success match-btn"
+                                                data-bs-toggle="tooltip"
+                                                title="Like"
+                                                type="button">
+                                            <i class="bi bi-suit-heart"></i>
+                                        </button>
+                                    </div>
+                                </div>
+                            {% endif %}
                 </div>
 
-                <ul class="list-group mb-4">
+                <!-- <ul class="list-group mb-4">
                   {% if res.molecular_weight is not none %}
                   <li class="list-group-item">
                     <strong>Molecular Weight:</strong>
@@ -311,9 +358,9 @@
                     {{ res.hydrogen_bonding_donors }}
                   </li>
                   {% endif %}
-                </ul>
+                </ul> -->
 
-                <div class="d-flex justify-content-around mt-4">
+                <!-- <div class="d-flex justify-content-around mt-4">
                   <button
                     id="dislikeBtn"
                     class="btn btn-outline-danger match-btn"
@@ -333,7 +380,7 @@
                   >
                     <i class="bi bi-suit-heart"></i>
                   </button>
-                </div>
+                </div> -->
               </div>
             </div>
           </div>
@@ -347,9 +394,17 @@
       const likeBtn = document.getElementById("likeBtn");
       const dislikeBtn = document.getElementById("dislikeBtn");
 
-      const name = document.getElementById("compoundName");
-      const smiles = document.getElementById("smiles");
-      const img = document.getElementById("compoundImage");
+      const nameEl = document.getElementById("compoundName");
+      const smilesEl = document.getElementById("smiles");
+      const imgEl = document.getElementById("compoundImage");
+
+  // holds the currently displayed compound 
+  let current = null;
+
+  function setDoneState() {
+    card.innerHTML = "<h3 class='p-4 text-center'>No more compounds!</h3>";
+  }
+
 
       async function swipe(direction) {
         likeBtn.disabled = true;
@@ -381,6 +436,48 @@
           dislikeBtn.disabled = false;
         }, 400);
       }
+      function renderCompound(m) {
+    current = m;
+    nameEl.textContent = m.name;
+    smilesEl.textContent = m.smiles;
+     imgEl.src = `/compound-image?smiles=${encodeURIComponent(m.smiles)}`;
+  }
+  async function loadNext() {
+    likeBtn.disabled = true;
+    dislikeBtn.disabled = true;
+    const res = await fetch("/api/get-next-match");
+    const data = await res.json();
+    if (data.done) {
+      setDoneState();
+      return;
+    }
+    renderCompound(data);
+     likeBtn.disabled = false;
+    dislikeBtn.disabled = false;
+  }
+  async function swipe(direction) {
+    if (!current) return;
+      likeBtn.disabled = true;
+    dislikeBtn.disabled = true;
+
+    card.classList.add(direction === "like" ? "swipe-right" : "swipe-left");
+
+    // sends current card info to api
+    await fetch("/api/match", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        action: direction === "like" ? "like" : "dislike",
+        smiles: current.smiles,
+        name: current.name
+      })
+    });
+
+    setTimeout(() => {
+      card.classList.remove("swipe-left", "swipe-right");
+      loadNext();
+    }, 400);
+  }
 
       likeBtn.addEventListener("click", () => swipe("like"));
       dislikeBtn.addEventListener("click", () => swipe("skip"));
@@ -402,6 +499,8 @@
           new bootstrap.Tooltip(tooltipTriggerEl);
         }
       );
+        // load first card on page load
+       loadNext();
     </script>
   </body>
 </html>

@@ -4,7 +4,7 @@ import pandas as pd
 
 FILTERED_PATH = "datasets/compounds_filtered.csv"
 df = pd.read_csv(FILTERED_PATH, dtype={"Smiles": str})
-df = df[["Name", "Smiles"]]
+df = df[["Name", "Smiles", "Molecular Weight", "AlogP", "HBA", "HBD"]]
 compounds = df.to_dict(orient="records")
 
 

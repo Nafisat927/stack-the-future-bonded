@@ -22,11 +22,42 @@ from match_compounds import match_compounds
 import google.genai as genai
 from rdkit import Chem
 from rdkit.Chem import Descriptors, Crippen, Lipinski
+import numpy as np
+from scipy.spatial.distance import cosine
+from utils import smiles_to_vector, rocchio_update
 
-# FILTERED_PATH = "datasets/compounds_filtered.csv"
-# df = pd.read_csv(FILTERED_PATH)
-# df = df[["Name", "Smiles", "Molecular Weight", "AlogP", "HBA", "HBD"]]
-# compounds = df.to_dict(orient="records")
+FILTERED_PATH = "datasets/compounds_filtered.csv"
+df = pd.read_csv(FILTERED_PATH)
+df = df[["Name", "Smiles", "Molecular Weight", "AlogP", "HBA", "HBD"]]
+compounds = df.to_dict(orient="records")
+
+# Precompute vectors 
+MOLECULE_CACHE = []
+for row in compounds:
+    smiles = str(row.get("Smiles", "")).strip()
+    name = str(row.get("Name", "Unknown"))
+    if not smiles:
+        continue
+
+    vec = smiles_to_vector(smiles)
+    if vec is None:
+        continue
+
+    MOLECULE_CACHE.append( #store for matching
+        {
+            "name": name,
+            "smiles": smiles,
+            "vector": vec,
+            "props": {
+                "molecular_weight": row.get("Molecular Weight"),
+                "lipophilicity": row.get("AlogP"),
+                "hydrogen_bonding_acceptors": row.get("HBA"),
+                "hydrogen_bonding_donors": row.get("HBD"),
+            },
+        }
+    )
+
+print(f"Cache Ready: {len(MOLECULE_CACHE)} compounds.")
 
 load_dotenv()
 # Configuring Gemini API
@@ -106,12 +137,55 @@ def save_match(
         .table("matches")
         .select("compound_name")
         .eq("compound_name", data["compound_name"])
+        .eq("user_id", user_id)
         .execute()
     )
     compound_exists = len(check_res.data) > 0
 
     if not compound_exists:
         sb_client.table("matches").insert(data).execute()
+
+def pick_next_match(user_vec: np.ndarray, seen_smiles: set[str], allowed_smiles: set[str] | None):
+    # filter out seen smiles from allowed smiles
+    available = []
+    for m in MOLECULE_CACHE:
+        if m["smiles"] in seen_smiles:
+            continue
+        if allowed_smiles is not None and m["smiles"] not in allowed_smiles:
+            continue
+        available.append(m)
+
+    if not available:
+        return None
+
+    #If user vector is basically all zeros -> can't compute meaningful similarity
+    norm = np.linalg.norm(user_vec)
+    cold = (
+        np.all(user_vec == 0)
+        or norm < 1e-10
+        or np.any(np.isnan(user_vec))
+        or np.any(np.isinf(user_vec))
+    )
+    #so pick random one
+    if cold:
+        import random
+        return random.choice(available)
+
+    # otherwise: best cosine distance
+    best = None
+    best_dist = float("inf")
+    for m in available:
+        try:
+            d = cosine(user_vec, m["vector"])  # 0=similar, 1=different
+        except Exception:
+            continue
+        if np.isnan(d) or np.isinf(d):
+            continue
+        if d < best_dist:
+            best_dist = d
+            best = m
+
+    return best
 
 
 @app.route("/", methods=["GET"])
@@ -218,7 +292,57 @@ def matching():
         res=res,
         done=False,
     )
+@app.route("/api/get-next-match", methods=["GET"])
+#Filters first, then ranks inside the filtered set
+def api_get_next_match():
+    guard = require_login()
+    if guard:
+        return jsonify({"error": "unauthorized"}), 401
 
+    user_id = get_user_id()
+
+    # 1) Hard preferences 
+    pref_res = sb_service().table("prefs").select("*").eq("user_id", user_id).execute()
+    prefs = pref_res.data[0] if pref_res.data else {}
+
+    molw = prefs.get("molecular_weight", "na")
+    lip  = prefs.get("lipophilicity", "na")
+    hba  = prefs.get("hydrogen_bonding_acceptors", "na")
+    hbd  = prefs.get("hydrogen_bonding_donors", "na")
+
+    # Use your existing filter engine to restrict candidates
+    filtered = match_compounds(molw, lip, hba, hbd)
+    allowed_smiles = set(str(c["Smiles"]).strip() for c in filtered if c.get("Smiles"))
+
+    # 2) Load user vector + seen list
+    uv = sb_service().table("user_vectors").select("*").eq("user_id", user_id).execute()
+
+    if not uv.data:
+        zero_vec = [0.0] * 2048
+        sb_service().table("user_vectors").insert(
+            {"user_id": user_id, "preference_vector": zero_vec, "seen_smiles": []}
+        ).execute()
+        user_vec = np.array(zero_vec, dtype=float)
+        seen_smiles = set()
+    else:
+        row = uv.data[0]
+        user_vec = np.array(row["preference_vector"], dtype=float)
+        seen_smiles = set(row["seen_smiles"] or [])
+
+    # 3) Pick next best match
+    best = pick_next_match(user_vec, seen_smiles, allowed_smiles)
+
+    if not best:
+        return jsonify({"done": True})
+
+    return jsonify(
+        {
+            "done": False,
+            "name": best["name"],
+            "smiles": best["smiles"],
+            "properties": best["props"],
+        }
+    )
 
 @app.route("/api/match", methods=["POST"])
 def api_match():
@@ -228,6 +352,8 @@ def api_match():
 
     payload = request.get_json()
     action = payload.get("action")
+    smiles = (payload.get("smiles") or "").strip()
+    name = payload.get("name") or "Unknown"
 
     prefs = get_preferences()
 
@@ -246,6 +372,22 @@ def api_match():
     compound = compounds[idx]
     user_id = get_user_id()
 
+    # 1) Load current user vector row
+    uv = sb_service().table("user_vectors").select("*").eq("user_id", user_id).execute()
+    if not uv.data:
+        return jsonify({"error": "user_vectors row missing"}), 400
+
+    row = uv.data[0]
+    current_vec = np.array(row["preference_vector"], dtype=float)
+    seen = row["seen_smiles"] or []
+
+    # 2) convert smile to vector
+    mol_vec = smiles_to_vector(smiles)
+    if mol_vec is None:
+        return jsonify({"error": "invalid smiles"}), 400
+
+    # 3) Rocchio update
+
     if action == "like":
         properties = {
             "molecular_weight": compound.get("Molecular Weight"),
@@ -254,7 +396,7 @@ def api_match():
             "hydrogen_bonding_donors": compound.get("HBD"),
         }
 
-        print("DEBUG: Saving match:", compound["Name"])
+
 
         save_match(
             sb_user(),
@@ -263,6 +405,18 @@ def api_match():
             compound.get("Smiles"),
             properties,
         )
+
+        new_vec = rocchio_update(current_vec, [mol_vec], [])
+    else:
+        new_vec = rocchio_update(current_vec, [], [mol_vec])
+
+    # seen smiles
+    if smiles not in seen:
+        seen.append(smiles)
+    # update user vectors
+    sb_service().table("user_vectors").update(
+        {"preference_vector": new_vec.tolist(), "seen_smiles": seen}
+    ).eq("user_id", user_id).execute()
 
     update_index(idx + 1)
 
@@ -274,6 +428,17 @@ def api_match():
             "smiles": next_compound["Smiles"],
         }
     )
+    #Save match to matches table if liked 
+    # if action == "like":
+    #     props = None
+    #     for m in MOLECULE_CACHE:
+    #         if m["smiles"] == smiles:
+    #             props = m["props"]
+    #             break
+
+    #     save_match(sb_user(), user_id, name, smiles, props)
+
+    # return jsonify({"status": "ok"})
 
 
 def set_match_info(prefs, compound):
